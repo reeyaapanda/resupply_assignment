@@ -1,5 +1,5 @@
 # Resupply Assignment  
-Evaluation of the Item Database Feature  
+Item Database Performance Analysis: Classification Stability and Recycling Drivers
 
 ## Overview  
 This project evaluates Resupply’s Item Database feature by comparing donor-selected items with driver-recorded items. The analysis examines recategorization patterns, recycling fees, and size-based item performance.
