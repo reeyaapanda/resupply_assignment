@@ -15,7 +15,7 @@ This project evaluates Resupply’s Item Database feature by comparing donor-sel
 - `resupply_assignment.Rmd`  
   Code for the full analytical report including methodology, modeling, and recommendations.
 
-- `final_report.html`  
+- `resupply_assignment.html`  
   Rendered HTML version of the final report.
 
 ## Methods  
