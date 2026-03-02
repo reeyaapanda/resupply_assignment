@@ -1,0 +1,1177 @@
+---
+title: "Item Database Performance Analysis: Classification Stability and Recycling Drivers"
+author: "Reeya Panda"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+# Executive Summary
+
+This report evaluates Item Database performance by analyzing size recategorization at pickup and recycling fee incidence across more than 10,000 donations. Recategorization occurs in 28% of donations, but most adjustments involve only one or two items. Instability is concentrated at mid-spectrum size boundaries, particularly between Medium and Large, indicating localized ambiguity rather than systemic misclassification.
+
+Recycling fees are added in roughly one third of donations and are concentrated among bulky or resale-constrained items. Donations that undergo recategorization are materially more likely to incur recycling charges. Item-level modeling shows that higher recategorization rates are strongly associated with higher recycling incidence, even after controlling for size. These findings are observational and reflect statistical associations, not causal effects.
+
+Overall, the database appears directionally sound but exhibits targeted classification friction. The evidence supports refining high-ambiguity Medium-tier categories and reviewing policies for structurally high-recycling items rather than removing items from the catalog.
+
+# Data Construction & SQL Workflow Overview
+
+To evaluate how well items are categorized in the database, we compare what donors initially report with what drivers record on site. The raw data contain both sets of information, but in their original form they do not directly indicate whether discrepancies reflect size misclassification, underreporting, or item removal.
+
+For example, if a donor reports two Medium items and the driver records two Large items instead, this likely reflects size recategorization. However, if the driver records three Large items, the additional item may represent underreporting rather than misclassification. Similarly, if fewer items are taken than originally reported, that reflects removal rather than recategorization.
+
+To separate these mechanisms cleanly, the SQL workflow constructs structured behavioral measures in two stages: a donation-level summary that isolates category shifts from quantity changes, and an item-level dataset that links those behavioral outcomes back to specific items in the database.
+
+A key design decision concerns how recategorization is measured. Because we only observe net category counts before and after pickup, we do not see which specific items moved across size groups. Instead, we infer the minimum number of cross-category swaps required to reconcile the initial and adjusted counts. This is calculated as the minimum of total positive and total negative category deltas. Conceptually, each recategorized item must leave one category and enter another, so the smaller of the two determines how many full reassignments occurred. This approach isolates size misclassification while avoiding inflation from pure underreporting or removals. However, this measure remains indirect and conservative. The data do not observe actual item-level movements across categories. Instead, recategorization is reconstructed from net differences in reported counts.
+
+The resulting dataset distinguishes between recategorization, net additions, and net removals, allowing downstream analysis to focus specifically on database classification quality. The SQL pipeline was built in two stages: donation-level feature construction and item-level aggregation.
+
+
+## 1. Donation Level Summary
+
+I created the `donation_level_summary` view to transform raw donation form data into structured behavioral measures at the donation level.
+
+- Cast initial item counts, adjusted item counts, and recycling fees to integers to ensure numeric consistency.
+- Computed total initial and total adjusted quantities to capture overall changes in reported volume.
+- Calculated category level deltas as adjusted minus initial counts for each size group.
+- Decomposed total change into three distinct components:
+  - **Recategorization**, defined as cases where at least one category decreases and at least one category increases.
+  - **Net additions**, when adjusted totals exceed initial totals.
+  - **Net removals**, when adjusted totals fall below initial totals.
+- Measured effective recategorization as the minimum of total positive and total negative category deltas. This captures the maximum number of items that could have been reclassified across size categories while separating out pure additions or removals.
+- Created binary indicators for:
+  - Recategorization
+  - Exact match between initial and adjusted counts
+  - Presence of a recycling fee
+- Measured quantity underreporting as the positive difference between adjusted and initial totals.
+
+This step converts raw submission data into behaviorally interpretable metrics that distinguish between size reclassification, underreporting, and item removal, enabling cleaner downstream statistical analysis.
+
+
+## 2. Item Level Performance
+
+I created the `item_level_performance` view to connect donation-level behavioral outcomes and recycling fees to individual items in the database.
+
+- Used a CTE to explode the JSON `item_data` field so each donation–item pair appears as a separate row.  
+- Filtered to valid items where `type = 'Item'` and an `item_id` exists.  
+- Extracted the donation-level recycling fee amount.  
+- Introduced a second CTE that keeps only distinct `(donation_id, item_id)` pairs. This ensures that if the same item appears multiple times within a single donation, it is counted once for aggregation purposes.  
+- Joined the deduplicated donation–item pairs to the `item_database` to attach item characteristics such as:  
+  - Resale value  
+  - Sellthrough rate  
+  - Size specifications  
+- Joined donation-level behavioral metrics from `donation_level_summary`.  
+
+For each item, I computed:
+
+- **Total donations** using `COUNT(DISTINCT donation_id)`, ensuring each donation is counted once per item even if the item appears multiple times within the same donation.  
+- **Total recycling fees**, defined as the sum of donation-level recycling fees across all distinct donations containing the item. Because the data are deduplicated at the donation–item level, recycling fees are not double counted when an item appears more than once within a single submission.  
+- **Recategorization rate**, computed as the proportion of donations containing the item for which `recategorization_flag = 1`, relative to the total number of distinct donations in which the item appears.  
+- **Average effective recategorization count**, defined as the average number of items that were reassigned to a different size category within donations containing the item. This isolates size shifts from pure additions or removals.  
+- **Recycling rate**, defined as the probability that a recycling fee was charged in donations containing the item.  
+
+This structure links item characteristics to downstream behavioral patterns and recycling costs while preventing donation-level outcomes from being unintentionally inflated when an item appears multiple times within the same donation.
+
+```{r setup, message=FALSE, warning=FALSE, echo = FALSE}
+library(tidyverse)
+library(scales)
+library(patchwork)
+library(plotly)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(gt)
+library(broom)
+
+ilp <- read_csv("item_level_performance.csv")
+dls <- read_csv("donation_level_summary.csv")
+```
+
+# Categorization Accuracy 
+**Research Question:**  How well are items categorized in the database? Are they consistently re-categorized on site?
+
+## 1. Donation Level Metrics
+
+To answer this question, we examine on-site adjustments made during donation pickup. If items are frequently re-categorized by drivers, this suggests systematic discrepancies between database classifications and operational reality.
+
+The first table reports key performance indicators, including the share of donations that required recategorization, the exact categorization rate, and the average number of items adjusted per donation. The second table presents the distribution of recategorization intensity, showing whether corrections are typically minor or substantial.
+
+Together, these metrics provide a donation-level assessment of classification accuracy and consistency.
+
+### a) Donation-Level Categorization Accuracy
+
+To evaluate overall categorization accuracy at the donation level, the following summary statistics compute key performance indicators capturing the frequency and magnitude of on site recategorizations.
+
+```{r donation_kpi_dashboard,  echo = FALSE}
+kpi_table <- dls %>%
+  summarise(
+    `Total Donations` = n(),
+    `Share of Donations Recategorized` = mean(recategorization_flag, na.rm = TRUE),
+    `Exact Categorization Rate` = mean(exact_match_flag, na.rm = TRUE),
+    `Average Items Recategorized per Donation` = mean(effective_recategorization_count, na.rm = TRUE)
+  )
+
+kpi_table %>%
+  gt() %>%
+  tab_header(
+    title = "Donation-Level Categorization Accuracy"
+  ) %>%
+  fmt_number(
+    columns = `Total Donations`,
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_percent(
+    columns = c(`Share of Donations Recategorized`,
+                `Exact Categorization Rate`),
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns = `Average Items Recategorized per Donation`,
+    decimals = 2
+  )
+```
+**Inference** : The results indicate that recategorization is relatively common in practice. Approximately 28.3% of donations required at least one on-site adjustment, suggesting that more than one in four donations did not fully align with database classifications. At the same time, the exact categorization rate is 44.4%, meaning that fewer than half of donations perfectly matched their originally reported size categories.
+
+However, the average number of items recategorized per donation is 0.57, indicating that while adjustments are frequent, they are typically limited in magnitude. Overall, this suggests moderate but systematic discrepancies between database categorization and operational reality rather than large-scale misclassification.
+
+### b) Statistical Precision of the Recategorization Rate
+
+To assess the statistical precision of the estimated recategorization rate, the following calculation constructs a 95% confidence interval using a normal approximation to the sampling distribution of the proportion.
+```{r recat_ci_table, echo=FALSE}
+# Estimate
+p_hat <- mean(dls$recategorization_flag, na.rm = TRUE)
+n <- nrow(dls)
+
+# Standard error
+se <- sqrt(p_hat * (1 - p_hat) / n)
+
+# 95% normal CI
+ci_lower <- p_hat - 1.96 * se
+ci_upper <- p_hat + 1.96 * se
+
+# Create table
+ci_table <- tibble(
+  Metric = "Recategorization Rate",
+  Estimate = p_hat,
+  CI_Lower = ci_lower,
+  CI_Upper = ci_upper,
+  Sample_Size = n
+)
+
+ci_table %>%
+  gt() %>%
+  tab_header(
+    title = "Precision of Recategorization Rate"
+  ) %>%
+  fmt_percent(
+    columns = c(Estimate, CI_Lower, CI_Upper),
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns = Sample_Size,
+    use_seps = TRUE
+  )
+```
+**Statistical Precision of the Recategorization Rate** The estimated recategorization rate is 28.3%. Using a standard normal approximation, the 95% confidence interval is [27.4%, 29.1%]. This interval is very narrow, reflecting the large sample size of over 10,000 donations.
+
+Formally reporting a confidence interval provides statistical precision, but in this context it is largely confirmatory. With such a large dataset, sampling variability is minimal and the point estimate is already highly stable. The key takeaway is therefore not statistical significance, but magnitude: approximately one in four donations involves at least one size recategorization.
+
+
+### c) Distribution of On-Site Recategorizations
+
+To better understand the intensity of on site adjustments, the following table summarizes the full distribution of the number of items recategorized per donation.
+
+```{r recategorization_distribution,  echo = FALSE}
+distribution_table <- dls %>%
+  mutate(
+    `Items Recategorized` = ifelse(
+      effective_recategorization_count > 5,
+      "5+",
+      as.character(effective_recategorization_count)
+    )
+  ) %>%
+  count(`Items Recategorized`, name = "Number of Donations") %>%
+  mutate(
+    `Share of Donations` = `Number of Donations` / sum(`Number of Donations`)
+  ) %>%
+  arrange(
+    as.numeric(ifelse(`Items Recategorized` == "5+", 6, `Items Recategorized`))
+  )
+
+distribution_table %>%
+  gt() %>%
+  tab_header(
+    title = "Distribution of On-Site Recategorizations"
+  ) %>%
+  fmt_number(
+    columns = `Number of Donations`,
+    use_seps = TRUE
+  ) %>%
+  fmt_percent(
+    columns = `Share of Donations`,
+    decimals = 1
+  )
+```
+
+**Inference** The distribution of recategorization intensity shows that 71.7% of donations involved no cross-category reclassification. Among the remaining donations, most corrections were limited in scope. Approximately 16.4% involved the reclassification of a single item, while progressively fewer donations required multiple category shifts. Cases involving five or more recategorizations account for only 1.2% of total donations.
+
+This pattern indicates that although size reclassification is not rare, it is typically modest in magnitude. Large-scale misclassification appears infrequent, suggesting that discrepancies are concentrated within a subset of donations rather than reflecting a systematic breakdown in the categorization framework.
+
+### d) Recategorization Intensity
+
+To isolate the intensity of adjustments among affected cases, the following visualization examines the distribution of recategorizations conditional on donations that required at least one on site correction.
+
+*All plots allow you to hover over elements to view exact values, percentages and/or confidence intervals.*
+
+```{r recat_positive_only_plotly, echo=FALSE}
+recat_positive <- dls %>%
+  filter(effective_recategorization_count > 0) %>%
+  mutate(
+    recat_group = ifelse(
+      effective_recategorization_count > 5,
+      "5+",
+      as.character(effective_recategorization_count)
+    )
+  ) %>%
+  count(recat_group) %>%
+  mutate(share = n / sum(n)) %>%
+  arrange(as.numeric(ifelse(recat_group == "5+", 6, recat_group)))
+
+plot_ly(
+  recat_positive,
+  x = ~recat_group,
+  y = ~share,
+  type = "bar",
+  marker = list(color = "#E74C3C"),
+  hovertemplate = paste(
+    "Items Recategorized: %{x}<br>",
+    "Share Among Recategorized Donations: %{y:.1%}<extra></extra>"
+  )
+) %>%
+  layout(
+    title = "Recategorization Intensity (Conditional on Recategorization)",
+    xaxis = list(title = "Number of Items Recategorized"),
+    yaxis = list(title = "Share Among Recategorized Donations", tickformat = ".0%"),
+    plot_bgcolor = "white",
+    paper_bgcolor = "white"
+  )
+```
+
+**Inference** : Conditioning on donations that involved at least one recategorization, the distribution of intensity remains highly concentrated at low levels. Approximately 58% of recategorized donations involve the reassignment of a single item, while an additional 23% involve two items. Together, this means that over 80% of recategorized donations involve no more than two cross-category adjustments.
+
+Higher-intensity cases are comparatively rare. Donations involving three or more recategorizations account for a small minority, and instances of five or more adjustments represent only a modest share of recategorized donations.
+
+This pattern reinforces the earlier conclusion that recategorization is typically limited in magnitude. When discrepancies occur, they are usually isolated item-level adjustments rather than large-scale restructuring of the reported donation. The evidence therefore points toward localized size ambiguity rather than systematic breakdowns in the overall categorization framework.
+
+### e) Adjacent Size Category Recategorizations Heatmap
+
+To examine where size discrepancies occur within the classification structure, the following heatmap summarizes inferred adjacent category shifts based on net differences between originally reported and on site adjusted counts.
+
+```{r adjacent_heatmap_clean, echo=FALSE}
+adjacent_matrix <- dls %>%
+  mutate(
+    Small_to_Medium = pmin(pmax(-delta_s, 0), pmax(delta_m, 0)),
+    Medium_to_Small = pmin(pmax(-delta_m, 0), pmax(delta_s, 0)),
+    Medium_to_Large = pmin(pmax(-delta_m, 0), pmax(delta_l, 0)),
+    Large_to_Medium = pmin(pmax(-delta_l, 0), pmax(delta_m, 0)),
+    Large_to_XL = pmin(pmax(-delta_l, 0), pmax(delta_xl, 0)),
+    XL_to_Large = pmin(pmax(-delta_xl, 0), pmax(delta_l, 0))
+  ) %>%
+  summarise(
+    Small_to_Medium = sum(Small_to_Medium),
+    Medium_to_Small = sum(Medium_to_Small),
+    Medium_to_Large = sum(Medium_to_Large),
+    Large_to_Medium = sum(Large_to_Medium),
+    Large_to_XL = sum(Large_to_XL),
+    XL_to_Large = sum(XL_to_Large)
+  )
+
+# Build 4x4 matrix
+sizes <- c("Small", "Medium", "Large", "Extra Large")
+
+heatmap_data <- expand.grid(
+  from = sizes,
+  to = sizes
+) %>%
+  mutate(value = 0)
+
+# Fill only adjacent cells
+heatmap_data$value[
+  heatmap_data$from == "Small" & heatmap_data$to == "Medium"
+] <- adjacent_matrix$Small_to_Medium
+
+heatmap_data$value[
+  heatmap_data$from == "Medium" & heatmap_data$to == "Small"
+] <- adjacent_matrix$Medium_to_Small
+
+heatmap_data$value[
+  heatmap_data$from == "Medium" & heatmap_data$to == "Large"
+] <- adjacent_matrix$Medium_to_Large
+
+heatmap_data$value[
+  heatmap_data$from == "Large" & heatmap_data$to == "Medium"
+] <- adjacent_matrix$Large_to_Medium
+
+heatmap_data$value[
+  heatmap_data$from == "Large" & heatmap_data$to == "Extra Large"
+] <- adjacent_matrix$Large_to_XL
+
+heatmap_data$value[
+  heatmap_data$from == "Extra Large" & heatmap_data$to == "Large"
+] <- adjacent_matrix$XL_to_Large
+
+# Plot
+
+max_value <- max(heatmap_data$value)
+
+plot_ly(
+  heatmap_data,
+  x = ~to,
+  y = ~from,
+  z = ~value,
+  type = "heatmap",
+  colorscale = list(
+    c(0, "#F7FBFF"),      # very light
+    c(0.3, "#6BAED6"),    # medium
+    c(0.6, "#2171B5"),    # strong blue
+    c(1, "#08306B")       # deep navy
+  ),
+  zmin = 0,
+  zmax = max_value,
+  hovertemplate = paste(
+    "From: %{y}<br>",
+    "To: %{x}<br>",
+    "Items Shifted: %{z}<extra></extra>"
+  )
+) %>%
+  layout(
+    title = "Adjacent Size Category Recategorizations",
+    xaxis = list(title = "Reassigned To"),
+    yaxis = list(title = "Originally Reported As"),
+    plot_bgcolor = "white",
+    paper_bgcolor = "white"
+  )
+```
+**Inference** : The heatmap shows inferred adjacent size-category recategorizations based on net differences between initially reported and on-site adjusted counts. The largest concentration of shifts occurs between Large and Extra Large, followed by Medium and Large, while transitions involving Small are relatively limited. This suggests that ambiguity is primarily concentrated at the upper size boundaries.
+
+These transitions are not directly observed item-level movements but are inferred from aggregate category deltas. **Only adjacent category shifts are considered**, so the figure should be interpreted as a diagnostic of boundary instability rather than a complete mapping of all possible recategorizations.
+
+## 2. Item-Level Metrics
+
+Having established that recategorization occurs at the donation level, we now examine whether certain items are consistently associated with cross-category recategorization.
+
+### a) Item-Level Summary Statistics
+
+Shifting from the donation level to the item level, the following summary statistics characterize frequency, recategorization exposure, recycling incidence, and resale value across unique items in the dataset.
+
+```{r item_summary_table, echo=FALSE}
+
+summary_table <- ilp %>%
+  summarise(
+    `Total Unique Items` = n(),
+    `Average Donations per Item` = mean(total_donations, na.rm = TRUE),
+    `Median Donations per Item` = median(total_donations, na.rm = TRUE),
+    `Average Recategorization Rate` = mean(recategorization_rate, na.rm = TRUE),
+    `Average Recycling Rate` = mean(recycling_rate, na.rm = TRUE),
+    `Average Resale Value` = mean(resale_value, na.rm = TRUE)
+  )
+
+summary_table %>%
+  gt() %>%
+  tab_header(
+    title = "Item-Level Summary Statistics"
+  ) %>%
+  fmt_number(
+    columns = c(`Total Unique Items`,
+                `Average Donations per Item`,
+                `Median Donations per Item`,
+                `Average Resale Value`),
+    decimals = 1,
+    use_seps = TRUE
+  ) %>%
+  fmt_percent(
+    columns = c(`Average Recategorization Rate`,
+                `Average Recycling Rate`),
+    decimals = 1
+  )
+```
+**Inference** : The item-level statistics reveal a highly skewed distribution of donation frequency. While the average item appears in 128.7 donations, the median is only 23, indicating that a small subset of items accounts for a large share of total volume.
+
+On average, items are involved in recategorized donations 34.9% of the time, and recycling fees are applied in 37.9% of associated donations, suggesting meaningful exposure to operational adjustments at the item level.
+
+The sellthrough rate is not reported because it is currently initialized to a constant value of 0.33 for all items, and therefore does not provide informative variation for analysis.
+
+### b) Top 10 Items with Highest Recategorization Rates
+
+To identify which specific items are most associated with categorization instability, the following table ranks items by recategorization rate, restricting attention to those with sufficient donation volume for statistical stability.
+```{r high_recat_items, echo=FALSE}
+high_recat_items <- ilp %>%
+  filter(total_donations >= 30) %>%
+  mutate(
+    `Size Category` = case_when(
+      small_specification == 1 ~ "Small",
+      medium_specification == 1 ~ "Medium",
+      large_specification == 1 ~ "Large",
+      extra_large_specification == 1 ~ "Extra Large"
+    )
+  ) %>%
+  arrange(desc(recategorization_rate)) %>%
+  select(
+    `Item Name` = item_name,
+    `Size Category`,
+    `Number of Donations` = total_donations,
+    `Recategorization Rate` = recategorization_rate
+  ) %>%
+  slice(1:10)
+
+high_recat_items %>%
+  gt() %>%
+  tab_header(
+    title = "Top 10 Items with Highest Recategorization Rates",
+    subtitle = "Restricted to items with at least 30 donations for stability"
+  ) %>%
+  fmt_number(
+    columns = `Number of Donations`,
+    use_seps = TRUE
+  ) %>%
+  fmt_percent(
+    columns = `Recategorization Rate`,
+    decimals = 1
+  )
+```
+
+**Inference** : The items with the highest recategorization rates are overwhelmingly concentrated in the Medium size category, with a small number in Large. Notably, 8 of the top 10 high-recategorization items are classified as Medium. This aligns with earlier evidence showing elevated instability around the Medium–Large boundary.
+
+For example, over 57% of donations containing a Lamp or Wall Art / Frame involve recategorization, nearly double the overall donation-level baseline of 28.3%. Similar patterns appear across other Medium-sized items such as Storage Bin / Box, Cocktail Table, and Storage Bench.
+
+Importantly, these rates indicate that donations containing these items are more likely to involve size adjustments, not necessarily that the specific item itself was reassigned. However, the consistent clustering within the Medium category suggests structural ambiguity in mid-spectrum size definitions rather than isolated item-level anomalies.
+
+Overall, the evidence points toward systematic classification friction concentrated in the Medium size tier.
+
+### c) Distribution of Item-Level Recategorization Rates
+
+To evaluate whether recategorization is concentrated among a small subset of items or broadly distributed across the catalog, the following density plot shows the distribution of item-level recategorization rates for sufficiently frequent items.
+
+```{r recat_density_refined, echo=FALSE}
+overall_rate <- mean(dls$recategorization_flag, na.rm = TRUE)
+
+p <- ggplot(
+  ilp %>% filter(total_donations >= 30),
+  aes(x = recategorization_rate)
+) +
+  geom_density(
+    fill = "#4C78A8",      # softer blue
+    alpha = 0.5,
+    color = "#4C78A8",
+    linewidth = 0.6
+  ) +
+  geom_vline(
+    xintercept = overall_rate,
+    linetype = "dashed",
+    linewidth = 0.6,
+    color = "#7F7F7F"      # neutral gray instead of red
+  ) +
+  labs(
+    title = "Distribution of Item-Level Recategorization Rates",
+    x = "Recategorization Rate",
+    y = "Density"
+  ) +
+  scale_x_continuous(labels = percent_format()) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+ggplotly(p)
+```
+
+**Inference** : Most items have recategorization rates between about 25% and 45%, meaning that for many items, roughly one in three donations involving that item required a size adjustment.
+
+The dashed line shows the overall donation-level recategorization rate. Since much of the distribution is close to or slightly above this line, item-level exposure to recategorization is broadly in line with the overall system pattern.
+
+In short, recategorization does not appear to be driven by just a few extreme items. Instead, it is fairly common across much of the item catalog.
+
+
+### d) Item Level Recategorization and Size
+
+To examine whether classification instability varies systematically across the size hierarchy, the following plot compares item-level recategorization rates by size category.
+```{r recat_by_size_plot, echo=FALSE}
+size_data <- ilp %>%
+  filter(total_donations >= 30) %>%
+  mutate(
+    size = case_when(
+      small_specification == 1 ~ "Small",
+      medium_specification == 1 ~ "Medium",
+      large_specification == 1 ~ "Large",
+      extra_large_specification == 1 ~ "Extra Large"
+    ),
+    size = factor(
+      size,
+      levels = c("Small", "Medium", "Large", "Extra Large")
+    )
+  )
+
+p <- ggplot(size_data, aes(x = size, y = recategorization_rate)) +
+  geom_boxplot(
+    fill = "#4C78A8",
+    alpha = 0.4,
+    outlier.alpha = 0.3
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.3,
+    size = 1.5,
+    color = "#2c3e50"
+  ) +
+  labs(
+    title = "Item-Level Recategorization Rates by Size Category",
+    x = "Size Category",
+    y = "Recategorization Rate"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+ggplotly(p)
+```
+
+**Inference:** Recategorization rates differ meaningfully across size categories. Medium items exhibit the highest median recategorization rate, followed by Large items. In contrast, Small and Extra Large items show lower median rates and slightly tighter distributions.
+
+This pattern suggests that size instability is most pronounced in the middle of the size spectrum, particularly around the Medium–Large boundary. The evidence supports the idea that classification ambiguity is more likely between adjacent mid-sized categories rather than at the extremes.
+
+
+## Summary: How Well Is the Database Categorized?
+
+Across more than 10,000 donations, approximately 28% required at least one size recategorization. While this indicates that discrepancies are not rare, most adjustments are small in magnitude, typically involving only one or two items.
+
+Recategorization appears concentrated in adjacent size transitions, particularly between Medium and Large and between Large and Extra Large. Item-level analysis further suggests that mid-sized items are disproportionately associated with cross-category adjustments.
+
+Taken together, the evidence indicates moderate but localized classification friction rather than systemic breakdown. Instability is concentrated at size boundaries, especially in the middle of the size spectrum.
+
+
+# Recycling Fee Metrics
+**Research Question:** Do certain items lead to more recycling fees getting added on-site?
+
+Having established patterns of recategorization, the next question is whether certain items are systematically linked to the addition of recycling fees at pickup.
+
+### a) Donation-Level Recycling Fee Summary
+
+To quantify the prevalence and intensity of recycling adjustments at the donation level, the following summary statistics report both incidence and distributional characteristics of recycling fee events.
+
+```{r recycling_kpi_table, echo=FALSE}
+recycling_rate <- mean(dls$recycling_fee_flag, na.rm = TRUE)
+
+total_fee_events <- sum(dls$recycling_fees_raw, na.rm = TRUE)
+
+median_fee_events <- median(dls$recycling_fees_raw, na.rm = TRUE)
+
+p95_fee_events <- as.numeric(
+  quantile(dls$recycling_fees_raw, 0.95, na.rm = TRUE)
+)
+
+recycling_table <- tibble(
+  Metric = c(
+    "Recycling Fee Rate",
+    "Total Recycling Fee Events",
+    "Median Fee Events per Donation",
+    "95th Percentile of Fee Events"
+  ),
+  Value = c(
+    recycling_rate,
+    total_fee_events,
+    median_fee_events,
+    p95_fee_events
+  )
+)
+
+recycling_table %>%
+  gt() %>%
+  tab_header(
+    title = "Donation-Level Recycling Fee Summary"
+  ) %>%
+  fmt_percent(
+    columns = Value,
+    rows = Metric == "Recycling Fee Rate",
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns = Value,
+    rows = Metric != "Recycling Fee Rate",
+    decimals = 2,
+    use_seps = TRUE
+  )
+```
+**Inference** : Recycling fee events are highly concentrated. 32.8% of donations incur at least one recycling charge, resulting in a median of zero. The distribution is strongly right-skewed, with the 95th percentile reaching 11 fee events, indicating that a relatively small subset of donations accounts for a disproportionate share of recycling adjustments. This pattern suggests that recycling is common in incidence but uneven in intensity, with a heavy upper tail driven by a limited number of high-adjustment cases. Given this skewness, the main analysis relies on the recycling fee flag rather than the raw event count. The binary indicator more directly captures whether an item increases the likelihood of triggering a recycling adjustment at all, which aligns with the core research question and produces more stable, interpretable estimates than modeling highly dispersed count outcomes.
+
+### b) Items with Elevated Recycling Rates
+
+To identify which specific items are most strongly associated with recycling adjustments, the following forest plot ranks high-volume items by recycling rate and displays corresponding 95% confidence intervals relative to the overall baseline. 
+
+```{r recycling_forest_plotly, echo=FALSE}
+baseline <- mean(dls$recycling_fee_flag, na.rm = TRUE)
+
+forest_data <- ilp %>%
+  filter(total_donations >= 30) %>%
+  mutate(
+    se = sqrt(recycling_rate * (1 - recycling_rate) / total_donations),
+    lower = recycling_rate - 1.96 * se,
+    upper = recycling_rate + 1.96 * se
+  ) %>%
+  arrange(desc(recycling_rate)) %>%
+  slice(1:15)
+
+# Reverse order for cleaner top-down ranking
+forest_data$item_name <- factor(
+  forest_data$item_name,
+  levels = rev(forest_data$item_name)
+)
+
+plot_ly(
+  forest_data,
+  x = ~recycling_rate,
+  y = ~item_name,
+  type = "scatter",
+  mode = "markers",
+  marker = list(size = 8, color = "#1f3b4d"),
+  error_x = list(
+    type = "data",
+    symmetric = FALSE,
+    array = forest_data$upper - forest_data$recycling_rate,
+    arrayminus = forest_data$recycling_rate - forest_data$lower,
+    color = "#4C78A8",
+    thickness = 1.5,
+    width = 0
+  ),
+  hovertemplate = paste(
+    "<b>%{y}</b><br>",
+    "Recycling Rate: %{x:.1%}<br>",
+    "95% CI: [", 
+    sprintf("%.1f%%", 100*forest_data$lower), ", ",
+    sprintf("%.1f%%", 100*forest_data$upper), 
+    "]<extra></extra>"
+  )
+) %>%
+  layout(
+    title = "Items with Elevated Recycling Rates",
+    xaxis = list(
+      title = "Recycling Rate",
+      tickformat = ".0%",
+      range = c(0.20, 0.90)
+    ),
+    yaxis = list(title = ""),
+    shapes = list(
+      list(
+        type = "line",
+        x0 = baseline,
+        x1 = baseline,
+        y0 = -0.5,
+        y1 = length(forest_data$item_name) - 0.5,
+        line = list(
+          dash = "dash",
+          color = "gray40",
+          width = 1
+        )
+      )
+    ),
+    plot_bgcolor = "white",
+    paper_bgcolor = "white"
+  )
+```
+
+
+**Inference** : The forest plot focuses exclusively on items with at least 30 donations to ensure statistical stability. Several of these high volume items have recycling rates substantially above the overall baseline shown by the dashed line. In particular, Box Spring and Mattress exhibit the highest recycling rates, with confidence intervals that lie well above the system-wide average. This indicates that these items are not just marginally elevated, but consistently associated with higher recycling charges across donations.
+
+For many other items, recycling rates are also above baseline, though the confidence intervals are wider, reflecting comparitively smaller sample sizes and greater uncertainty. Importantly, the elevated rates are not confined to a single outlier; rather, multiple bulky or disposal-intensive items appear systematically more likely to incur recycling fees.
+
+Overall, the evidence suggests that recycling fees are not randomly distributed across the catalog. Instead, they are concentrated in specific item categories, particularly large or difficult-to-resell items, indicating structural drivers of on-site recycling adjustments.
+
+### c) Recycling Rates by Size Category
+
+To assess whether recycling adjustments vary systematically across the size hierarchy, the following plot compares item-level recycling rates by size category, restricting attention to stable items with at least 30 donations. 
+
+```{r recycling_by_size_clean, echo=FALSE}
+
+baseline_recycling <- mean(dls$recycling_fee_flag, na.rm = TRUE)
+
+size_data <- ilp %>%
+  filter(total_donations >= 30) %>%
+  mutate(
+    Size = case_when(
+      small_specification == 1 ~ "Small",
+      medium_specification == 1 ~ "Medium",
+      large_specification == 1 ~ "Large",
+      extra_large_specification == 1 ~ "Extra Large"
+    ),
+    Size = factor(Size, levels = c("Small", "Medium", "Large", "Extra Large"))
+  )
+
+plot_ly(
+  size_data,
+  x = ~Size,
+  y = ~recycling_rate,
+  type = "box",
+  boxpoints = "all",
+  jitter = 0.3,
+  pointpos = 0,
+  marker = list(
+    color = "#black",
+    size = 6,
+    opacity = 0.35
+  ),
+  line = list(color = "#1f3b4d"),
+  fillcolor = "#4C78A8",
+  opacity = 0.5,
+  hovertemplate = paste(
+    "Size: %{x}<br>",
+    "Recycling Rate: %{y:.1%}<extra></extra>"
+  )
+) %>%
+  layout(
+    title = "Recycling Rates by Size Category",
+    yaxis = list(
+      title = "Recycling Rate",
+      tickformat = ".0%"
+    ),
+    xaxis = list(title = "Size Category"),
+    shapes = list(
+      list(
+        type = "line",
+        x0 = -0.5,
+        x1 = 3.5,
+        y0 = baseline_recycling,
+        y1 = baseline_recycling,
+        line = list(
+          dash = "dash",
+          color = "black",
+          width = 1
+        )
+      )
+    ),
+    plot_bgcolor = "white",
+    paper_bgcolor = "white"
+  )
+```
+
+**Inference**: Recycling rates differ across size categories, with Medium, Large, and Extra Large items exhibiting higher median recycling rates than Small items. However, the number of Small items in the sample is relatively limited, which reduces the precision of that category’s estimated distribution. While the pattern suggests that larger items are more likely to incur recycling fees, conclusions regarding Small items should be interpreted cautiously due to the smaller sample size. Overall, the evidence indicates that recycling is structurally more common among mid-to-large items.
+
+### d) ANOVA: Recycling Rate by Size Category
+
+To formally test whether observed differences in recycling rates across size tiers are statistically meaningful, the following one way ANOVA compares mean recycling rates among Medium, Large, and Extra Large items.
+
+```{r anova_recycling_size, echo=FALSE}
+
+# Drop Small category
+size_data_no_small <- size_data %>%
+  filter(Size != "Small") %>%
+  droplevels()
+
+# Run ANOVA
+anova_model <- aov(
+  recycling_rate ~ Size,
+  data = size_data_no_small
+)
+
+# Tidy results
+anova_results <- tidy(anova_model)
+
+anova_results %>%
+  filter(term != "Residuals") %>%
+  transmute(
+    Term = term,
+    `Degrees of Freedom` = df,
+    `F Statistic` = statistic,
+    `P Value` = p.value
+  ) %>%
+  gt() %>%
+  tab_header(
+    title = "ANOVA: Recycling Rate by Size Category",
+    subtitle = "Medium, Large, and Extra Large Items"
+  ) %>%
+  fmt_number(
+    columns = `F Statistic`,
+    decimals = 2
+  ) %>%
+  fmt_scientific(
+    columns = `P Value`,
+    decimals = 2
+  )
+```
+
+**Inference** : The ANOVA results indicate that recycling rates differ significantly across Medium, Large, and Extra Large items. The F statistic is 3.40 with 2 degrees of freedom, and the p value of 0.036 suggests that at conventional significance levels, we reject the null hypothesis that mean recycling rates are equal across size categories. This implies that size category is associated with differences in recycling rates among these larger items. However, since this analysis is based on observational data rather than a randomized study, this should not be interpreted as a causal effect of size on recycling outcomes, only as evidence of a statistically significant association.
+
+
+### e) Recycling Fees by Recategorization Status
+
+To examine the relationship between size adjustments and recycling charges, the following table reports recycling incidence conditional on recategorization status.
+
+```{r recycling_vs_recat_conditional, echo=FALSE}
+recycling_conditional <- dls %>%
+  count(recategorization_flag, recycling_fee_flag) %>%
+  group_by(recategorization_flag) %>%
+  mutate(
+    Share = n / sum(n),
+    recategorization_flag = ifelse(recategorization_flag == 1,
+                                   "Recategorized",
+                                   "Not Recategorized"),
+    recycling_fee_flag = ifelse(recycling_fee_flag == 1,
+                                "Recycling Fee Added",
+                                "No Recycling Fee")
+  ) %>%
+  ungroup()
+
+recycling_conditional %>%
+  gt() %>%
+  tab_header(
+    title = "Recycling Fees by Recategorization Status"
+  ) %>%
+  cols_label(
+    recategorization_flag = "Recategorization Status",
+    recycling_fee_flag = "Recycling Fee Status",
+    n = "Number of Donations",
+    Share = "Within-Group Share"
+  ) %>%
+  fmt_percent(
+    columns = Share,
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns = n,
+    use_seps = TRUE
+  )
+```
+**Inference** : Recycling fees are substantially more common among recategorized donations. While only 28.7% of non recategorized donations incur a recycling fee, the share rises to 43.2% among recategorized donations, a difference of more than 14 percentage points.
+
+This indicates a strong association between on site size adjustments and the likelihood of adding a recycling charge. Donations that require recategorization appear operationally more complex and are significantly more likely to trigger additional disposal related costs. Overall, recycling fees are not independent of recategorization status but are meaningfully concentrated among donations that undergo size corrections.
+
+### f) Testing Independence: Recategorization and Recycling
+
+To formally test whether recycling fees and recategorization occur independently, the following chi square analysis compares observed counts to the frequencies expected under statistical independence.
+```{r chi_square, echo=FALSE}
+recat_recycle_table <- table(
+  dls$recategorization_flag,
+  dls$recycling_fee_flag
+)
+
+# Run chi-square test
+chi_test <- chisq.test(recat_recycle_table)
+chi_results <- tibble(
+  Statistic = chi_test$statistic,
+  Degrees_of_Freedom = chi_test$parameter,
+  P_Value = chi_test$p.value
+)
+expected_df <- as.data.frame.matrix(chi_test$expected)
+
+# Add rownames as a column
+expected_df <- expected_df %>%
+  tibble::rownames_to_column(var = "Recategorization Status")
+
+# Rename columns
+colnames(expected_df) <- c(
+  "Recategorization Status",
+  "No Recycling Fee",
+  "Recycling Fee Added"
+)
+
+expected_df %>%
+  gt() %>%
+  tab_header(
+    title = "Expected Counts Under Independence",
+    subtitle = "If Recycling and Recategorization Were Unrelated"
+  ) %>%
+  fmt_number(
+    columns = c("No Recycling Fee", "Recycling Fee Added"),
+    decimals = 0,
+    use_seps = TRUE
+  )
+
+chi_results %>%
+  gt() %>%
+  tab_header(
+    title = "Chi-Square Test of Independence",
+    subtitle = "Recycling Fees and Recategorization"
+  ) %>%
+  fmt_number(
+    columns = Statistic,
+    decimals = 2
+  ) %>%
+  fmt_scientific(
+    columns = P_Value,
+    decimals = 2
+  )
+
+# Total sample size
+N <- sum(recat_recycle_table)
+
+# Phi coefficient
+phi_value <- sqrt(as.numeric(chi_test$statistic) / N)
+
+phi_results <- tibble(
+  Phi = phi_value
+)
+
+phi_results %>%
+  gt() %>%
+  tab_header(
+    title = "Effect Size (Phi Coefficient)",
+    subtitle = "Strength of Association"
+  ) %>%
+  fmt_number(
+    columns = Phi,
+    decimals = 3
+  )
+```
+
+**Inference** : The expected counts under independence differ meaningfully from the observed frequencies, particularly for donations that were recategorized and incurred a recycling fee. Under independence, 964 recycling cases would be expected among recategorized donations, yet 1,270 are observed. The chi square test indicates a statistically significant association between recycling fees and recategorization (χ² = 200.44, p < 0.001). However, the magnitude of the chi square statistic is amplified by the large sample size of over 10,000 observations, as this test statistic scales with N. The Phi coefficient of 0.139 therefore provides important context, showing that the strength of association is modest in practical terms despite overwhelming statistical significance. Substantively, donations involving size adjustments are more likely to incur recycling charges, but the relationship is far from deterministic. 
+
+### g) Multivariate Model of Recycling Fee Incidence
+
+To jointly evaluate the effects of size category and classification instability on recycling outcomes, the following quasibinomial logistic regression models the probability of a recycling fee at the item level.
+
+```{r quasibinomial model, echo = FALSE, warning = FALSE}
+model_data <- ilp %>%
+  filter(total_donations >= 30) %>%
+  mutate(
+    Size = case_when(
+      small_specification == 1 ~ "Small",
+      medium_specification == 1 ~ "Medium",
+      large_specification == 1 ~ "Large",
+      extra_large_specification == 1 ~ "Extra Large"
+    ),
+    Size = factor(Size),
+
+    recycled_count = round(recycling_rate * total_donations),
+    not_recycled_count = total_donations - recycled_count
+  )
+
+model_glm <- glm(
+  cbind(recycled_count, not_recycled_count) ~ 
+    Size + recategorization_rate,
+  family = quasibinomial,
+  data = model_data
+)
+
+tidy_glm <- broom::tidy(model_glm) %>%
+  mutate(
+    Odds_Ratio = exp(estimate),
+    Significant = p.value < 0.05
+  ) %>%
+  select(
+    Term = term,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `t value` = statistic,
+    `P Value` = p.value,
+    `Odds Ratio` = Odds_Ratio,
+    Significant
+  )
+
+tidy_glm %>%
+  gt() %>%
+  tab_header(
+    title = "Quasibinomial Logistic Regression",
+    subtitle = "Predicting Probability of Recycling Fee"
+  ) %>%
+  fmt_number(
+    columns = c(Estimate, `Std. Error`, `t value`),
+    decimals = 3
+  ) %>%
+  fmt_scientific(
+    columns = `P Value`,
+    decimals = 2
+  ) %>%
+  fmt_number(
+    columns = `Odds Ratio`,
+    decimals = 2
+  ) %>%
+  cols_label(
+    Term = "Predictor"
+  ) %>%
+  data_color(
+    columns = `P Value`,
+    rows = Significant == TRUE,
+    colors = scales::col_numeric(
+      palette = c("#fde0dd"),
+      domain = NULL
+    )
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(weight = "bold")
+    ),
+    locations = cells_body(
+      columns = `P Value`,
+      rows = Significant == TRUE
+    )
+  ) %>%
+  cols_hide(Significant)
+```
+**Inference** : In the final specification, recategorization rate is a strong and statistically significant predictor of recycling fee incidence at the item level. Items that appear more frequently in recategorized donations have substantially higher odds of being associated with a recycling charge.
+
+This is an observational analysis rather than a randomized study, and I do not interpret these results causally. The model identifies a robust statistical association between classification instability and recycling fees, but it does not establish that recategorization directly causes recycling. Unobserved operational factors could influence both processes.
+
+Controlling for recategorization rate, Small items have significantly lower odds of receiving a recycling fee relative to the reference category. Medium and Large items are not statistically different from the reference category once instability is accounted for. This suggests that much of the apparent size effect operates through its relationship with classification instability rather than through size alone.
+
+Overall, the evidence indicates that recycling fees are more **strongly associated ** with item-level classification instability than with size category in isolation.
+
+**Other Models Tried**
+
+a) A standard binomial logistic regression was first estimated, but diagnostic checks revealed substantial overdispersion. To obtain more reliable standard errors, the model was re-estimated using a quasibinomial specification. Resale value was also tested but found to be statistically insignificant and showed mild nonlinearity, so it was excluded from the final model.
+
+b) A Poisson count model was estimated using total recycling fee events as the dependent variable, with total donations included as an exposure offset. The results were directionally consistent with the logistic specification, indicating that items with higher recategorization rates generate more recycling fee events. However, the model did not provide substantively new insights beyond the probability-based analysis, so the main discussion focuses on the more interpretable recycling rate specification using the logistic/odds-ratio framework. (Principle of Parsimony)
+
+
+# Items to be split or removed?
+**Research Question:** Are there any items in our database that should be split into multiple items or removed entirely?
+
+The data do not suggest that any items need to be removed from the database entirely. Recategorization is fairly spread out across items, so this does not look like a case where a few bad entries are driving all the problems. Instead, the issue seems to be size ambiguity within certain categories.
+
+Several high-volume Medium items, such as Lamp, Wall Art / Frame, and Storage Bin / Box, show elevated recategorization rates. These categories likely group together items that vary a lot in actual size. For example, a small table lamp and a tall floor lamp are very different physically but may fall under the same label. Splitting these broader categories into more specific ones would likely reduce on-site adjustments.
+
+At the same time, items like Mattress and Box Spring consistently show high recycling rates. This does not necessarily mean they should be removed, but they may require clearer donor messaging, adjusted pricing, or automatic recycling fees given their higher likelihood of rejection.
+
+Overall, the findings point toward refining and clarifying certain categories rather than shrinking the catalog.
+
+To make this recommendation more concrete, the table below identifies the top 10 items that exceed system-wide baselines in either recategorization rate, recycling rate, or both, while maintaining sufficient donation volume for stability. These items represent the strongest candidates for category refinement, splitting, or pricing adjustments based on their combined operational friction.
+
+```{r, echo = FALSE}
+# Baselines
+baseline_recat <- mean(dls$recategorization_flag, na.rm = TRUE)
+baseline_recycle <- mean(dls$recycling_fee_flag, na.rm = TRUE)
+
+# Flagging logic
+flagged_items <- ilp %>%
+  filter(total_donations >= 30) %>%   # stability threshold
+  mutate(
+    high_recat = recategorization_rate > baseline_recat,
+    high_recycle = recycling_rate > baseline_recycle,
+    review_flag = case_when(
+      high_recat & high_recycle ~ "High Recategorization + High Recycling",
+      high_recat ~ "High Recategorization",
+      high_recycle ~ "High Recycling",
+      TRUE ~ "Normal"
+    )
+  ) %>%
+  filter(review_flag != "Normal") %>%
+  arrange(desc(recategorization_rate + recycling_rate)) %>%
+  slice_head( n = 10) %>% 
+  select(
+    item_name,
+    total_donations,
+    recategorization_rate,
+    recycling_rate,
+    review_flag
+  )
+
+flagged_items %>%
+  gt() %>%
+  tab_header(
+    title = "Top 10 Items Recommended for Category Refinement"
+  ) %>%
+  fmt_percent(
+    columns = c(recategorization_rate, recycling_rate),
+    decimals = 1
+  ) %>%
+  fmt_number(
+    columns = total_donations,
+    use_seps = TRUE
+  )
+```
+
+**Inference** : All top 10 flagged items show both higher-than-average recategorization and recycling rates, suggesting consistent operational friction rather than random variation. Bulky bed-related items such as Mattress, Box Spring, Bed Rail, and Bed Footboard combine high volume with high recycling incidence, indicating structural resale challenges and potential need for revised pricing or automatic recycling fees. At the same time, storage and hybrid furniture items like Storage Bench, Storage Trunk, and Shoe Rack / Cabinet likely suffer from size ambiguity within broad category definitions, leading to frequent on-site adjustments. Overall, the evidence supports refining and splitting certain high-friction categories rather than removing them from the database.
+
+
+# Data Discrepancies and Assumptions
+
+While the analysis above provides structured insights into categorization accuracy and recycling patterns, several data limitations and assumptions should be acknowledged. Importantly, each has potential implications for interpretation of the results.
+
+## 1. Inference of Recategorization from Net Category Deltas
+
+Recategorization is inferred using the minimum of total positive and total negative size-category deltas. This approach is principled and conservative, as it isolates the maximum number of cross-category swaps consistent with observed aggregate changes while avoiding inflation from pure additions or removals.
+
+However, this measure remains indirect. The data do not observe actual item-level movements across categories. Instead, recategorization is reconstructed from net differences in reported counts.
+
+This has several implications:
+
+- The exact item-level reassignment pathway cannot be observed.
+- Non-adjacent category shifts are not directly identified.
+- Complex multi-item adjustments may be simplified into aggregate swaps.
+- Some inferred recategorizations may slightly understate or misattribute the true reclassification process.
+
+If detailed item-level reclassification logs were available, estimates of recategorization intensity could differ. Nonetheless, the current approach is intentionally conservative and prioritizes internal consistency over aggressive attribution, reducing the risk of overstating classification instability.
+
+## 2. Independence of Donations
+
+Many statistical procedures used in this analysis, including confidence intervals, chi-square tests, and regression models, rely on the assumption that observations are independent.
+
+If donations originate from repeat donors, clustering at the donor level could induce correlation across observations. In that case:
+
+- Standard errors may be underestimated.
+- Confidence intervals may appear artificially narrow.
+- Statistical significance may be overstated.
+
+Due to the absence of donor-level identifiers, the analysis proceeds under the assumption that clustering is negligible or minimal. If repeated donor behavior is substantial, a clustered or hierarchical modeling framework would likely produce more conservative inference.
+
+## 3. Missingness in Charity-Related Columns
+
+Several charity-related fields contain missing values that appear non-random and distributed across all size categories.
+
+If missingness is systematically related to operational processes or item characteristics:
+
+- Excluding these fields may omit relevant predictors of recycling or recategorization.
+- Any unobserved association between charity assignment and operational adjustments may remain unmodeled.
+- Bias may arise if missingness correlates with item type or donation complexity.
+
+Because the pattern does not appear random, these variables are excluded from primary modeling to avoid introducing distorted estimates. However, this limits the scope of the analysis.
+
+## 4. Donations with `Total_adj = 0`
+
+A subset of donations contains zero adjusted items. It is unclear whether these represent cancelled pickups, complete on-site rejection, or operational edge cases.
+
+If these cases reflect fundamentally different operational scenarios, they could distort recategorization and recycling metrics. For example:
+
+- Recategorization rates may be understated if no adjusted counts are recorded.
+- Recycling incidence may be mismeasured if fees are structurally tied to item acceptance.
+- Summary statistics may incorporate operational cancellations rather than true classification outcomes.
+
+In the absence of additional metadata, these observations are retained. However, if zero-adjusted donations are systematically different from completed pickups, the reported rates may not fully reflect standard operational behavior.
+
+## 5. Constant Sell-Through Rate Initialization
+
+The sell-through rate variable is initialized to a constant value of 0.33 for all items. Because it contains no variation, it cannot contribute explanatory power in regression or comparative analysis.
+
+As a result:
+
+- The models cannot assess whether resale performance drives recycling or recategorization.
+- Any conclusions regarding operational friction exclude downstream resale viability as a measurable factor.
+- The recycling models may omit an economically relevant predictor.
+
+If true sell-through data were available, incorporating it could change coefficient estimates and potentially reduce the apparent association between recategorization and recycling.
+
+
+## 6. Observational Nature of the Analysis
+
+This study is observational rather than randomized. The regression results identify statistical associations between size, recategorization, and recycling outcomes, but **they do not establish causal relationships.**
+
+Unobserved operational factors, such as driver discretion, item condition, regional practices, or seasonal variation, may influence both recategorization and recycling (confounding). As such, the findings should be interpreted as descriptive and predictive rather than causal.
+
+
+# Conclusion
+
+This analysis evaluated the performance of the Item Database along two central operational dimensions: classification stability and recycling fee incidence. Across more than 10,000 donations, the evidence points to moderate but structured friction rather than systemic failure.
+
+First, size recategorization is not rare. Roughly 28 percent of donations involve at least one cross category adjustment. However, the magnitude of these corrections is typically small. Most recategorized donations involve only one or two items, and large scale reclassification is uncommon. The instability is concentrated at adjacent size boundaries, especially between Medium and Large, and to a lesser extent between Large and Extra Large. At the item level, Medium items exhibit the highest recategorization exposure, reinforcing the interpretation that ambiguity is strongest in the middle of the size spectrum rather than at the extremes.
+
+Second, recycling fees are meaningfully structured rather than randomly distributed. About one third of donations incur at least one recycling charge, but intensity is highly skewed, with a small subset of donations accounting for a disproportionate share of fee events. Certain bulky or resale constrained items, particularly bed related items and large furniture components, show consistently elevated recycling rates. These patterns appear systematic and persistent across high volume items.
+
+Third, classification instability and recycling are statistically associated. Donations that undergo recategorization are more likely to incur recycling fees, and item level modeling shows that recategorization rate is a strong predictor of recycling incidence even after controlling for size category. At the same time, the effect size is modest in practical terms, and the analysis is observational. These findings describe robust statistical relationships, not causal mechanisms. Unobserved operational factors could influence both processes.
+
+From a product and operations perspective, the results support targeted refinement rather than broad restructuring. The data do not indicate that items should be removed from the catalog entirely. Instead, the primary opportunity lies in clarifying and potentially splitting high ambiguity Medium tier categories, where physical size variation within a single label likely drives repeated on site adjustments. For structurally high recycling items such as mattresses and box springs, clearer donor messaging, pricing adjustments, or predefined recycling policies may better align expectations with operational reality.
+
+Overall, the Item Database appears directionally sound but exhibits localized boundary instability and predictable recycling concentration. Addressing these targeted friction points, particularly in mid sized categories and bulky resale constrained items, would likely reduce on site corrections, improve pricing transparency, and enhance operational efficiency without materially shrinking the catalog.
